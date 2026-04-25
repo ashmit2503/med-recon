@@ -1,11 +1,15 @@
+from unittest.mock import AsyncMock, patch
+
 from fastapi.testclient import TestClient
 
 from app.main import app
 
 
 def test_health_endpoint_returns_ok() -> None:
-    with TestClient(app) as client:
-        response = client.get("/api/health")
+    with patch("app.main.connect_to_mongo", new=AsyncMock()):
+        with patch("app.main.close_mongo_connection", new=AsyncMock()):
+            with TestClient(app) as client:
+                response = client.get("/api/health")
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}

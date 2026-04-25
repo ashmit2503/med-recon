@@ -3,6 +3,7 @@ from typing import Optional
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 
 from app.core.config import get_settings
+from app.db.schema import ensure_indexes
 
 
 class MongoState:
@@ -18,6 +19,7 @@ async def connect_to_mongo() -> None:
     settings = get_settings()
     mongo_state.client = AsyncIOMotorClient(settings.mongodb_uri)
     mongo_state.database = mongo_state.client[settings.mongodb_database]
+    await ensure_indexes(mongo_state.database)
 
 
 async def close_mongo_connection() -> None:
