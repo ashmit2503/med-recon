@@ -49,6 +49,25 @@ uvicorn app.main:app --reload
 GET http://127.0.0.1:8000/api/health
 ```
 
+## Seed Synthetic Data
+
+Generate realistic synthetic data across EHR, pharmacy dispense, and insurance claims
+sources, including clean and intentionally conflicted patients:
+
+```bash
+python -m app.scripts.seed_synthetic_data --patients 15
+```
+
+Notes:
+
+- Patient count must be between 10 and 20.
+- Re-running the script replaces prior seeded records with `seed-patient-*` keys.
+- For generation checks without database writes:
+
+```bash
+python -m app.scripts.seed_synthetic_data --patients 15 --dry-run
+```
+
 ## Domain Schema (MongoDB + Pydantic)
 
 Domain models are implemented in:
