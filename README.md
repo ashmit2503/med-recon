@@ -1,209 +1,192 @@
 # Medication Reconciliation & Conflict Reporting Service
 
-FastAPI service scaffold for medication reconciliation and conflict reporting workflows, with MongoDB-ready infrastructure.
+FastAPI service for ingesting medication lists from multiple sources, normalizing data,
+detecting cross-source conflicts, and exposing conflict analytics.
 
-## Stack
+## 5-Minute Quickstart
 
-- Python 3.12
-- FastAPI
-- MongoDB (Motor async driver)
-- pip requirements workflow
+### Prerequisites
 
-## Project Structure
+- Git
+- Python 3.11+
+- MongoDB running locally (default `mongodb://localhost:27017`)
 
-```
-app/
-  api/
-  core/
-  db/
-  models/
-  schemas/
-  services/
-tests/
-```
-
-## Quick Start
-
-1. Create and activate a virtual environment.
-2. Install dependencies:
+### Clone, install, and run
 
 ```bash
+git clone <your-repo-url>
+cd med-recon
+python -m venv .venv
+```
+
+PowerShell:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt -r requirements-dev.txt
-```
-
-3. Copy environment variables:
-
-```bash
-copy .env.example .env
-```
-
-4. Run the API:
-
-```bash
+Copy-Item .env.example .env
 uvicorn app.main:app --reload
 ```
 
-5. Verify health check:
+macOS/Linux:
 
 ```bash
-GET http://127.0.0.1:8000/api/health
+source .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
+cp .env.example .env
+uvicorn app.main:app --reload
 ```
 
-## Seed Synthetic Data
+Smoke check:
 
-Generate realistic synthetic data across EHR, pharmacy dispense, and insurance claims
-sources, including clean and intentionally conflicted patients:
+- Open `http://127.0.0.1:8000/docs`
+- Call `GET http://127.0.0.1:8000/api/health`
+
+## One-Command Seed Data
+
+Create realistic synthetic data (10-20 patients) across EHR, pharmacy, and claims with
+both clean and intentionally conflicted cohorts:
 
 ```bash
 python -m app.scripts.seed_synthetic_data --patients 15
 ```
 
-Notes:
-
-- Patient count must be between 10 and 20.
-- Re-running the script replaces prior seeded records with `seed-patient-*` keys.
-- For generation checks without database writes:
+Optional dry-run (no database writes):
 
 ```bash
 python -m app.scripts.seed_synthetic_data --patients 15 --dry-run
 ```
 
-## Domain Schema (MongoDB + Pydantic)
+## Architecture Overview
 
-Domain models are implemented in:
+### High-level flow
 
-- `app/models/patient.py`
-- `app/models/medication_snapshot.py`
-- `app/models/conflict.py`
-- `app/db/schema.py`
+1. Client ingests source medication list for a patient.
+2. Service normalizes drug names, doses, and units.
+3. Service creates a new patient snapshot version with all known sources.
+4. Conflict engine detects dose mismatches, dangerous class combinations, and
+   stopped-vs-active disagreements.
+5. Conflicts are upserted and exposed via patient and analytics endpoints.
 
-### patients collection
+### Code layout
 
-Stores patient identity, demographics, and stable identifiers used for matching.
-
-```json
-{
-  "_id": "uuid",
-  "patient_key": "patient-001",
-  "status": "active",
-  "demographics": {
-    "given_name": "Avery",
-    "family_name": "Nguyen",
-    "date_of_birth": "1985-04-02",
-    "sex": "female"
-  },
-  "identifiers": [
-    {"system": "MRN", "value": "12345"},
-    {"system": "NATIONAL_ID", "value": "987654321"}
-  ],
-  "allergies": ["penicillin"],
-  "active_snapshot_id": "snapshot-003",
-  "created_at": "2026-04-25T10:20:00Z",
-  "updated_at": "2026-04-25T10:20:00Z"
-}
+```
+app/
+  api/          # FastAPI routers and endpoint orchestration
+  core/         # Settings/config
+  db/           # Mongo connection + index setup
+  models/       # Pydantic domain models (documents)
+  schemas/      # API request/response schemas
+  services/     # Domain logic: normalization, detection, registries
+  scripts/      # Operational scripts (seed data)
+tests/
 ```
 
-### medication_snapshots collection (multi-source versioning)
+### Main API surface
 
-Captures reconciliation snapshots per patient. Each snapshot stores:
+- `POST /api/patients/{patient_key}/sources/{source}/medications/ingest`
+- `PATCH /api/patients/{patient_key}/conflicts/{conflict_id}/resolution`
+- `GET /api/patients/{patient_key}/conflicts`
+- `GET /api/analytics/clinics/{clinic_id}/patients-with-unresolved-conflicts`
+- `GET /api/analytics/clinics/conflicts/high-burden`
 
-- A monotonic `snapshot_version` per patient.
-- `source_versions[]` with one version entry per source (EHR, claims, pharmacy, patient-reported).
-- `merged_medications[]` as the reconciled view used by downstream conflict detection.
+## Schema Summary
 
-```json
-{
-  "_id": "uuid",
-  "patient_id": "patient-001",
-  "snapshot_version": 3,
-  "source_versions": [
-    {
-      "source": "ehr",
-      "version": "ehr-v23",
-      "captured_at": "2026-04-25T09:58:00Z",
-      "medications": [
-        {"medication_id": "med-1", "name": "Atorvastatin", "rxnorm_code": "83367"}
-      ]
-    },
-    {
-      "source": "pharmacy_dispense",
-      "version": "rx-v8",
-      "captured_at": "2026-04-25T10:00:00Z",
-      "medications": [
-        {"medication_id": "med-2", "name": "Lisinopril", "rxnorm_code": "29046"}
-      ]
-    }
-  ],
-  "merged_medications": [
-    {"medication_id": "med-1", "name": "Atorvastatin", "rxnorm_code": "83367"},
-    {"medication_id": "med-2", "name": "Lisinopril", "rxnorm_code": "29046"}
-  ],
-  "generated_at": "2026-04-25T10:01:00Z",
-  "created_at": "2026-04-25T10:01:00Z",
-  "updated_at": "2026-04-25T10:01:00Z"
-}
+### `patients`
+
+- Identity and demographics
+- Business key: `patient_key` (unique)
+- Important fields:
+  - `identifiers[]`
+  - `metadata.clinic_id`
+  - `active_snapshot_id`
+
+### `medication_snapshots`
+
+- Versioned patient medication state (`snapshot_version`)
+- `source_versions[]` contains source-specific medication lists
+- `merged_medications[]` stores reconciled, read-optimized view
+
+### `conflicts`
+
+- Conflict records tied to snapshot + patient
+- Types currently detected:
+  - `dosage_mismatch`
+  - `drug_interaction`
+  - `source_disagreement`
+- Resolution fields:
+  - `status`
+  - `resolved_at`
+  - `resolution_notes`
+
+## Indexing Summary
+
+Defined in `app/db/schema.py` and created on app startup.
+
+- `patients`
+  - unique: `patient_key`
+  - unique sparse: `identifiers.system + identifiers.value`
+  - recency: `updated_at`
+- `medication_snapshots`
+  - unique: `patient_id + snapshot_version`
+  - latest snapshot lookup: `patient_id + generated_at`
+  - source lineage: `source_versions.source + source_versions.version`
+- `conflicts`
+  - unique: `snapshot_id + conflict_key`
+  - triage/work queue indexes on `status` and `detected_at`
+  - medication analytics via `medications.rxnorm_code`
+
+## Assumptions and Trade-offs
+
+### Assumptions
+
+- Patient identity is resolved upstream and represented by `patient_key`.
+- Ingest creates a new snapshot version rather than mutating prior snapshots.
+- Conflict status lifecycle is managed through explicit resolve/dismiss actions.
+
+### Trade-offs
+
+- Denormalization in snapshots (`merged_medications`) and conflicts (`medications[]`) improves
+  read performance and analytics simplicity, at the cost of duplicated fields.
+- Application-level upsert logic for conflicts avoids duplicate records but requires careful
+  key construction and consistent conflict hashing.
+- Scripted synthetic data favors deterministic scenario coverage over clinical completeness.
+
+## Known Limitations
+
+- No authentication/authorization layer yet.
+- No pagination token strategy beyond simple `limit` parameters.
+- No background job queue for heavy ingest/analysis workloads.
+- No migration framework or environment-specific deployment manifests yet.
+- Conflict logic is rule-based and static; no probabilistic clinical scoring.
+
+## What I Would Do Next
+
+1. Add authn/authz (JWT + role-based access for pharmacists/providers).
+2. Add OpenTelemetry tracing and structured logging correlation IDs.
+3. Add Mongo transactions where multi-collection writes need stronger guarantees.
+4. Add load tests and performance budgets for ingest and analytics paths.
+5. Add CI pipeline gates for lint, tests, and type checks.
+6. Add Docker compose profile for one-command local stack startup.
+
+## AI Usage
+
+AI assistance was used to accelerate scaffolding and implementation drafts, including:
+
+- API/router boilerplate
+- Model and schema shaping
+- test skeleton generation
+- README restructuring
+
+All AI-produced code and docs were reviewed, refined, and validated by running lint/tests
+and enforcing repository commit standards (atomic conventional commits).
+
+## Developer Quality Checks
+
+```bash
+python -m pytest -q
+python -m ruff check .
 ```
-
-Validation rule: one source entry per snapshot (`source_versions` cannot contain duplicate source names).
-
-### conflicts collection
-
-Stores detected medication conflicts tied to a snapshot.
-
-```json
-{
-  "_id": "uuid",
-  "patient_id": "patient-001",
-  "snapshot_id": "snapshot-003",
-  "conflict_key": "snapshot-003:drug_interaction:med-1-med-2",
-  "conflict_type": "drug_interaction",
-  "severity": "high",
-  "status": "open",
-  "title": "Potential interaction detected",
-  "description": "Atorvastatin and clarithromycin overlap.",
-  "medications": [
-    {"medication_id": "med-1", "name": "Atorvastatin", "rxnorm_code": "83367"},
-    {"medication_id": "med-2", "name": "Clarithromycin", "rxnorm_code": "18631"}
-  ],
-  "detected_at": "2026-04-25T10:02:00Z",
-  "created_at": "2026-04-25T10:02:00Z",
-  "updated_at": "2026-04-25T10:02:00Z"
-}
-```
-
-Validation rule: closed conflicts (`resolved` or `dismissed`) must include `resolved_at`.
-
-## Indexing Rationale
-
-Index definitions live in `app/db/schema.py` and are applied on Mongo connect.
-
-- `patients.uq_patient_key` (unique): guarantees one canonical domain patient key.
-- `patients.uq_identifier_system_value` (unique, sparse): prevents duplicate identifier tuples across patients while allowing missing optional identifiers.
-- `patients.ix_patients_updated_at_desc`: supports recency queries and sync jobs.
-
-- `medication_snapshots.uq_patient_snapshot_version` (unique): enforces one snapshot version per patient.
-- `medication_snapshots.ix_snapshots_patient_generated_desc`: supports latest-snapshot lookup by patient.
-- `medication_snapshots.ix_snapshots_source_version`: supports lineage/audit queries by source and source version.
-- `medication_snapshots.ix_snapshots_rxnorm`: supports medication-level lookup and analytics.
-
-- `conflicts.uq_snapshot_conflict_key` (unique): deduplicates conflicts for a given snapshot.
-- `conflicts.ix_conflicts_patient_status_detected`: supports patient triage views (open/acknowledged first).
-- `conflicts.ix_conflicts_queue`: supports global conflict work queues.
-- `conflicts.ix_conflicts_rxnorm`: supports medication-centric conflict analytics.
-
-## Denormalization Trade-Offs
-
-- `merged_medications` duplicates data from `source_versions[].medications`.
-  - Benefit: read-optimized conflict detection and clinician-facing reconciliation views.
-  - Cost: write amplification and risk of divergence if merge logic is incorrect.
-
-- `conflicts.medications[]` duplicates key medication descriptors from snapshot records.
-  - Benefit: conflict documents remain self-contained for queue processing and reporting.
-  - Cost: updates to medication labels/codings are not automatically back-propagated.
-
-- `patients.active_snapshot_id` caches latest snapshot reference.
-  - Benefit: O(1) lookup for current reconciliation context.
-  - Cost: requires transactional discipline (or compensating updates) when new snapshots are published.
 
 ## Commit Policy
 

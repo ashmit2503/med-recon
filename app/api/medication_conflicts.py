@@ -1,11 +1,9 @@
-from collections import defaultdict
-from datetime import datetime
 import re
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import ValidationError
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
 from app.db.mongo import get_database
 from app.db.schema import CONFLICTS_COLLECTION, MEDICATION_SNAPSHOTS_COLLECTION, PATIENTS_COLLECTION
@@ -45,86 +43,94 @@ async def ingest_medications(
     payload: MedicationIngestRequest,
     database: AsyncIOMotorDatabase = Depends(get_database),
 ) -> MedicationIngestResponse:
-    patient = await _get_patient_or_404(database, patient_key)
-    current_snapshot = await _get_active_snapshot(database, patient)
-
-    source_version = payload.source_version or _default_source_version(source)
-    normalized_medications = _normalize_medications_for_ingest(payload.medications, source)
-
-    source_versions_by_source: dict[MedicationSource, SourceMedicationVersion] = {}
-    if current_snapshot is not None:
-        for source_version_entry in current_snapshot.source_versions:
-            source_versions_by_source[source_version_entry.source] = source_version_entry
-
-    source_versions_by_source[source] = SourceMedicationVersion(
-        source=source,
-        version=source_version,
-        medications=normalized_medications,
-    )
-
-    next_version = 1 if current_snapshot is None else current_snapshot.snapshot_version + 1
-    snapshot_id = _build_snapshot_id(patient.id, next_version)
-    source_versions = sorted(
-        source_versions_by_source.values(),
-        key=lambda value: value.source.value,
-    )
-
     try:
-        snapshot = MedicationSnapshotDocument(
-            _id=snapshot_id,
-            patient_id=patient.id,
-            snapshot_version=next_version,
-            source_versions=source_versions,
-            merged_medications=_build_merged_medications(source_versions),
-            metadata={
-                "ingested_source": source.value,
-                "ingested_source_version": source_version,
+        patient = await _get_patient_or_404(database, patient_key)
+        current_snapshot = await _get_active_snapshot(database, patient)
+
+        source_version = payload.source_version or _default_source_version(source)
+        normalized_medications = _normalize_medications_for_ingest(payload.medications, source)
+
+        source_versions_by_source: dict[MedicationSource, SourceMedicationVersion] = {}
+        if current_snapshot is not None:
+            for source_version_entry in current_snapshot.source_versions:
+                source_versions_by_source[source_version_entry.source] = source_version_entry
+
+        source_versions_by_source[source] = SourceMedicationVersion(
+            source=source,
+            version=source_version,
+            medications=normalized_medications,
+        )
+
+        next_version = 1 if current_snapshot is None else current_snapshot.snapshot_version + 1
+        snapshot_id = _build_snapshot_id(patient.id, next_version)
+        source_versions = sorted(
+            source_versions_by_source.values(),
+            key=lambda value: value.source.value,
+        )
+
+        try:
+            snapshot = MedicationSnapshotDocument(
+                _id=snapshot_id,
+                patient_id=patient.id,
+                snapshot_version=next_version,
+                source_versions=source_versions,
+                merged_medications=_build_merged_medications(source_versions),
+                metadata={
+                    "ingested_source": source.value,
+                    "ingested_source_version": source_version,
+                },
+            )
+        except ValidationError as error:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Snapshot validation failed: {error}",
+            ) from error
+
+        snapshots_collection = database[MEDICATION_SNAPSHOTS_COLLECTION]
+        try:
+            await snapshots_collection.insert_one(snapshot.model_dump(by_alias=True))
+        except DuplicateKeyError as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Snapshot insert collided with an existing version. Retry ingest.",
+            ) from error
+
+        patients_collection = database[PATIENTS_COLLECTION]
+        await patients_collection.update_one(
+            {"_id": patient.id},
+            {
+                "$set": {
+                    "active_snapshot_id": snapshot.id,
+                    "updated_at": utc_now(),
+                }
             },
         )
-    except ValidationError as error:
+
+        detected_conflicts = conflict_engine.detect_conflicts(snapshot)
+        persisted_conflicts, created_count, existing_count = await _upsert_conflicts(
+            database,
+            detected_conflicts,
+        )
+
+        return MedicationIngestResponse(
+            patient_id=patient.id,
+            patient_key=patient.patient_key,
+            snapshot_id=snapshot.id,
+            snapshot_version=snapshot.snapshot_version,
+            ingested_source=source,
+            source_version=source_version,
+            conflict_count=len(persisted_conflicts),
+            created_conflict_count=created_count,
+            existing_conflict_count=existing_count,
+            conflicts=persisted_conflicts,
+        )
+    except HTTPException:
+        raise
+    except PyMongoError as error:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Snapshot validation failed: {error}",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database operation failed while ingesting medications.",
         ) from error
-
-    snapshots_collection = database[MEDICATION_SNAPSHOTS_COLLECTION]
-    try:
-        await snapshots_collection.insert_one(snapshot.model_dump(by_alias=True))
-    except DuplicateKeyError as error:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Snapshot insert collided with an existing version. Retry ingest.",
-        ) from error
-
-    patients_collection = database[PATIENTS_COLLECTION]
-    await patients_collection.update_one(
-        {"_id": patient.id},
-        {
-            "$set": {
-                "active_snapshot_id": snapshot.id,
-                "updated_at": utc_now(),
-            }
-        },
-    )
-
-    detected_conflicts = conflict_engine.detect_conflicts(snapshot)
-    persisted_conflicts, created_count, existing_count = await _upsert_conflicts(
-        database,
-        detected_conflicts,
-    )
-
-    return MedicationIngestResponse(
-        patient_id=patient.id,
-        patient_key=patient.patient_key,
-        snapshot_id=snapshot.id,
-        snapshot_version=snapshot.snapshot_version,
-        ingested_source=source,
-        source_version=source_version,
-        conflict_count=len(persisted_conflicts),
-        created_conflict_count=created_count,
-        existing_conflict_count=existing_count,
-        conflicts=persisted_conflicts,
-    )
 
 
 @router.patch(
@@ -138,46 +144,58 @@ async def resolve_or_dismiss_conflict(
     payload: ConflictResolutionRequest,
     database: AsyncIOMotorDatabase = Depends(get_database),
 ) -> ConflictDocument:
-    patient = await _get_patient_or_404(database, patient_key)
+    try:
+        patient = await _get_patient_or_404(database, patient_key)
 
-    conflicts_collection = database[CONFLICTS_COLLECTION]
-    existing = await conflicts_collection.find_one({"_id": conflict_id, "patient_id": patient.id})
-    if existing is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Conflict was not found for the patient.",
+        conflicts_collection = database[CONFLICTS_COLLECTION]
+        existing = await conflicts_collection.find_one(
+            {"_id": conflict_id, "patient_id": patient.id}
+        )
+        if existing is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Conflict was not found for the patient.",
+            )
+
+        status_value = (
+            ConflictStatus.RESOLVED if payload.action == "resolve" else ConflictStatus.DISMISSED
+        )
+        now = utc_now()
+        resolution_notes = (
+            f"{payload.reason.strip()} (chosen_source={payload.chosen_source.value})"
         )
 
-    status_value = (
-        ConflictStatus.RESOLVED if payload.action == "resolve" else ConflictStatus.DISMISSED
-    )
-    now = utc_now()
-    resolution_notes = (
-        f"{payload.reason.strip()} (chosen_source={payload.chosen_source.value})"
-    )
-
-    await conflicts_collection.update_one(
-        {"_id": conflict_id, "patient_id": patient.id},
-        {
-            "$set": {
-                "status": status_value.value,
-                "resolved_at": now,
-                "resolution_notes": resolution_notes,
-                "updated_at": now,
-                "metadata.resolution_source": payload.chosen_source.value,
-                "metadata.resolution_action": payload.action,
-            }
-        },
-    )
-
-    updated = await conflicts_collection.find_one({"_id": conflict_id, "patient_id": patient.id})
-    if updated is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Conflict disappeared before update could be completed.",
+        await conflicts_collection.update_one(
+            {"_id": conflict_id, "patient_id": patient.id},
+            {
+                "$set": {
+                    "status": status_value.value,
+                    "resolved_at": now,
+                    "resolution_notes": resolution_notes,
+                    "updated_at": now,
+                    "metadata.resolution_source": payload.chosen_source.value,
+                    "metadata.resolution_action": payload.action,
+                }
+            },
         )
 
-    return ConflictDocument.model_validate(updated)
+        updated = await conflicts_collection.find_one(
+            {"_id": conflict_id, "patient_id": patient.id}
+        )
+        if updated is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Conflict disappeared before update could be completed.",
+            )
+
+        return ConflictDocument.model_validate(updated)
+    except HTTPException:
+        raise
+    except PyMongoError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database operation failed while updating conflict resolution.",
+        ) from error
 
 
 @router.get(
@@ -191,25 +209,36 @@ async def get_conflict_history(
     limit: int = Query(default=100, ge=1, le=500),
     database: AsyncIOMotorDatabase = Depends(get_database),
 ) -> ConflictHistoryResponse:
-    patient = await _get_patient_or_404(database, patient_key)
+    try:
+        patient = await _get_patient_or_404(database, patient_key)
 
-    query: dict[str, str] = {"patient_id": patient.id}
-    if status_filter is not None:
-        query["status"] = status_filter.value
+        query: dict[str, str] = {"patient_id": patient.id}
+        if status_filter is not None:
+            query["status"] = status_filter.value
 
-    conflicts_collection = database[CONFLICTS_COLLECTION]
-    conflict_docs = await (
-        conflicts_collection.find(query).sort([("detected_at", -1)]).limit(limit).to_list(length=limit)
-    )
+        conflicts_collection = database[CONFLICTS_COLLECTION]
+        conflict_docs = await (
+            conflicts_collection.find(query)
+            .sort([("detected_at", -1)])
+            .limit(limit)
+            .to_list(length=limit)
+        )
 
-    conflicts = [ConflictDocument.model_validate(document) for document in conflict_docs]
-    return ConflictHistoryResponse(
-        patient_id=patient.id,
-        patient_key=patient.patient_key,
-        total=len(conflicts),
-        status_filter=status_filter,
-        conflicts=conflicts,
-    )
+        conflicts = [ConflictDocument.model_validate(document) for document in conflict_docs]
+        return ConflictHistoryResponse(
+            patient_id=patient.id,
+            patient_key=patient.patient_key,
+            total=len(conflicts),
+            status_filter=status_filter,
+            conflicts=conflicts,
+        )
+    except HTTPException:
+        raise
+    except PyMongoError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database operation failed while retrieving conflict history.",
+        ) from error
 
 
 async def _get_patient_or_404(

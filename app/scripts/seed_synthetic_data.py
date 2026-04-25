@@ -10,6 +10,7 @@ import re
 from typing import Any
 
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+from pymongo.errors import PyMongoError
 
 from app.core.config import get_settings
 from app.db.schema import (
@@ -18,8 +19,7 @@ from app.db.schema import (
     PATIENTS_COLLECTION,
     ensure_indexes,
 )
-from app.models.base import utc_now
-from app.models.conflict import ConflictDocument, ConflictType
+from app.models.conflict import ConflictType
 from app.models.medication_snapshot import (
     MedicationItem,
     MedicationSnapshotDocument,
@@ -587,14 +587,24 @@ async def _run_async() -> None:
 
     try:
         database = client[settings.mongodb_database]
-        stats = await _seed_patients(database, args.patients, args.random_seed)
-        _validate_seed_stats(stats)
+        try:
+            stats = await _seed_patients(database, args.patients, args.random_seed)
+            _validate_seed_stats(stats)
+        except PyMongoError as error:
+            raise RuntimeError(
+                "MongoDB operation failed during seeding. "
+                "Verify connection settings and database availability."
+            ) from error
     finally:
         client.close()
 
 
 def main() -> None:
-    asyncio.run(_run_async())
+    try:
+        asyncio.run(_run_async())
+    except (ValueError, RuntimeError) as error:
+        print(f"Seed failed: {error}")
+        raise SystemExit(1) from error
 
 
 if __name__ == "__main__":
